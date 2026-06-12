@@ -47,7 +47,7 @@ def parse_detections(metadata: dict):
         if bbox_order == "xy":
             boxes = boxes[:, [1, 0, 3, 2]]
 
-        last_detections = [
+    last_detections = [
         Detection(box, category, score, metadata)
         for box, score, category in zip(boxes, scores, classes)
         if score > threshold and int(category) == 0  # 0 = person
@@ -60,7 +60,7 @@ def get_labels():
     labels = intrinsics.labels
 
     if intrinsics.ignore_dash_labels:
-       labels = [label for label in labels if label and label != "-"]
+        labels = [label for label in labels if label and label != "-"]
     return labels
 
 
