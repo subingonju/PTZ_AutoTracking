@@ -3,6 +3,7 @@ import sys
 from functools import lru_cache
 
 import cv2
+import serial  # pip install pyserial
 
 from picamera2 import MappedArray, Picamera2
 from picamera2.devices import IMX500
@@ -10,7 +11,57 @@ from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_dete
 
 last_detections = []
 
+# ──────────────────────────────────────────────
+# UART 설정
+# ──────────────────────────────────────────────
+UART_PORT = "/dev/ttyAMA0"
+UART_BAUD = 115200
+FRAME_WIDTH = 320   # IMX500 입력 해상도 (가로)
+FRAME_HEIGHT = 320  # IMX500 입력 해상도 (세로)
 
+try:
+    uart = serial.Serial(UART_PORT, baudrate=UART_BAUD, timeout=0.1)
+    print(f"[UART] {UART_PORT} 연결 완료")
+except Exception as e:
+    uart = None
+    print(f"[UART] 연결 실패 (테스트 모드로 실행): {e}")
+
+
+def build_packet(pan: int, tilt: int) -> bytes:
+    """
+    8바이트 UART 패킷 생성
+    [0xAA][CMD=0x01][Pan][Tilt][0x00][0x00][0x00][XOR]
+    """
+    pan  = max(0, min(180, pan))
+    tilt = max(0, min(180, tilt))
+    payload = [0xAA, 0x01, pan, tilt, 0x00, 0x00, 0x00]
+    checksum = 0
+    for b in payload:
+        checksum ^= b
+    payload.append(checksum)
+    return bytes(payload)
+
+
+def send_ptz(pan: int, tilt: int):
+    """STM32로 PTZ 명령 전송 + ACK 수신"""
+    if uart is None:
+        print(f"[UART] (dry-run) Pan={pan}, Tilt={tilt}")
+        return
+
+    packet = build_packet(pan, tilt)
+    uart.write(packet)
+
+    # ACK 수신 (8바이트, 0xBB start)
+    ack = uart.read(8)
+    if len(ack) == 8 and ack[0] == 0xBB:
+        print(f"[ACK] Pan={ack[2]}, Tilt={ack[3]}")
+    else:
+        print(f"[UART] ACK 없음 또는 불완전 (len={len(ack)})")
+
+
+# ──────────────────────────────────────────────
+# Detection 클래스
+# ──────────────────────────────────────────────
 class Detection:
     def __init__(self, coords, category, conf, metadata):
         """Create a Detection object, recording the bounding box, category and confidence."""
@@ -52,6 +103,19 @@ def parse_detections(metadata: dict):
         for box, score, category in zip(boxes, scores, classes)
         if score > threshold and int(category) == 0  # 0 = person
     ]
+
+    # ── PTZ 전송: 가장 신뢰도 높은 사람 1명 추적 ──
+    if last_detections:
+        best = max(last_detections, key=lambda d: d.conf)
+        x, y, w, h = best.box
+        center_x = x + w / 2
+        center_y = y + h / 2
+
+        pan_angle  = int((center_x / FRAME_WIDTH)  * 180)
+        tilt_angle = int((center_y / FRAME_HEIGHT) * 180)
+
+        send_ptz(pan_angle, tilt_angle)
+
     return last_detections
 
 
@@ -75,35 +139,29 @@ def draw_detections(request, stream="main"):
             x, y, w, h = detection.box
             label = f"{labels[int(detection.category)]} ({detection.conf:.2f})"
 
-            # Calculate text size and position
             (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             text_x = x + 5
             text_y = y + 15
 
-            # Create a copy of the array to draw the background with opacity
             overlay = m.array.copy()
 
-            # Draw the background rectangle on the overlay
             cv2.rectangle(
                 overlay,
                 (text_x, text_y - text_height),
                 (text_x + text_width, text_y + baseline),
-                (255, 255, 255),  # Background color (white)
+                (255, 255, 255),
                 cv2.FILLED,
             )
 
             alpha = 0.30
             cv2.addWeighted(overlay, alpha, m.array, 1 - alpha, 0, m.array)
 
-            # Draw text on top of the background
             cv2.putText(m.array, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-            # Draw detection box
             cv2.rectangle(m.array, (x, y), (x + w, y + h), (0, 255, 0, 0), thickness=2)
 
         if intrinsics.preserve_aspect_ratio:
             b_x, b_y, b_w, b_h = imx500.get_roi_scaled(request)
-            color = (255, 0, 0)  # red
+            color = (255, 0, 0)
             cv2.putText(m.array, "ROI", (b_x + 5, b_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             cv2.rectangle(m.array, (b_x, b_y), (b_x + b_w, b_y + b_h), (255, 0, 0, 0))
 
@@ -140,7 +198,6 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
 
-    # This must be called before instantiation of Picamera2
     imx500 = IMX500(args.model)
     intrinsics = imx500.network_intrinsics
     if not intrinsics:
@@ -150,7 +207,6 @@ if __name__ == "__main__":
         print("Network is not an object detection task", file=sys.stderr)
         exit()
 
-    # Override intrinsics from args
     for key, value in vars(args).items():
         if key == 'labels' and value is not None:
             with open(value, 'r') as f:
@@ -158,7 +214,6 @@ if __name__ == "__main__":
         elif hasattr(intrinsics, key) and value is not None:
             setattr(intrinsics, key, value)
 
-    # Defaults
     if intrinsics.labels is None:
         with open("assets/coco_labels.txt", "r") as f:
             intrinsics.labels = f.read().splitlines()
